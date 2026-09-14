@@ -1,0 +1,9 @@
+services:
+  gapfree:
+    build: .
+    container_name: gapfree
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7331:7331"   # localhost only; put Tailscale or an authed proxy in front to reach it elsewhere
+    volumes:
+      - ./data:/data
