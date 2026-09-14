@@ -36,6 +36,12 @@ Or just run it:
 python3 gapfree.py serve
 ```
 
+On a homelab box or container where you are root, the installer writes a
+system unit instead of a user one. Set `GAPFREE_BIND=0.0.0.0` before
+running it if the UI should be reachable from outside the container (put
+Tailscale or an SSH tunnel in front; there is no login). 256 MB of RAM and
+a 2 GB disk are plenty.
+
 ## First run
 
 1. Open http://localhost:7331. If the `gh` CLI is logged in on that machine
@@ -109,9 +115,22 @@ shows the service it runs under and the next planned days.
 Cron users can skip the service and run `python3 gapfree.py tick` every few
 minutes; the web UI is still needed once for setup.
 
+## Achievements
+
+The Achievements card reads the badges on your public profile and shows what
+each one takes. What this account learned the hard way: Quickdraw (close an
+issue within 5 minutes) and YOLO (merge a PR unreviewed) are earned solo, and
+gapfree does both on its own. Self-merged pull requests, self-co-authored
+commits and self-answered discussions earned nothing, even from a public
+repo, so Pull Shark, Pair Extraordinaire and Galaxy Brain need a second
+account you own. Put that account's token under Settings as the buddy:
+gapfree invites it to the repo, lets it merge your pull requests, adds it as
+co-author on PR commits, and has it ask the Q&A questions you answer and
+accept. Each stops at its top tier.
+
 ## Files
 
-- `~/.gapfree/config.json`: settings, seeds, overrides, issue and PR numbers per day (mode 600).
+- `~/.gapfree/config.json`: settings, tokens, seeds, overrides, issue and PR numbers per day (mode 600).
 - `~/.gapfree/repo`: local clone of the activity repo.
 - `~/.gapfree/gapfree.log`: what was pushed and when.
 

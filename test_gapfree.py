@@ -62,3 +62,7 @@ for y in (2025, 2026, 2027):
 assert g.mix_for(auto, 2025) != g.mix_for(auto, 2026) or g.mix_for(auto, 2026) != g.mix_for(auto, 2027)
 assert g.mix_for(cfg, 2025) == cfg["mix"]
 print("auto mix ok", [g.mix_for(auto, y) for y in (2025, 2026, 2027)])
+
+html = '<img alt="Achievement: YOLO" class="x"/> <img alt="Achievement: Pull Shark"/><span class="achievement-tier-label">x3</span>'
+assert g.parse_badges(html) == {"YOLO": 1, "Pull Shark": 3}, g.parse_badges(html)
+print("badges ok")

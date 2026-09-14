@@ -13,6 +13,7 @@ runs.
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -50,7 +51,17 @@ DEFAULTS = {
     "progress": {},              # date -> issue and PR numbers created that day
     "forward": False,            # keep committing every day
     "forward_since": "",         # first day the scheduler is responsible for
+    "buddy_token": "",           # a second account you own: merges your PRs, gets co-authored, asks what you answer
+    "quickdraw": True,           # once: open and close an issue within a minute
+    "pair": True,                # with a buddy: co-author it on PR commits (Pair Extraordinaire, up to 48 PRs)
+    "galaxy": True,              # with a buddy: answer its Q&A discussions (Galaxy Brain, up to 32)
+    "farm": {},                  # what the achievement steps have done so far
 }
+TIERS = {"Pull Shark": [2, 16, 128, 1024], "Pair Extraordinaire": [1, 10, 24, 48], "Galaxy Brain": [2, 8, 16, 32]}
+QUESTIONS = ["How do you rotate the log files?", "Is one file per day the right split?",
+             "Best way to back up the log?", "Keep the timezone in every entry?"]
+ANSWERS = ["One file per day under log/YYYY keeps it simple.", "Yes, a day per file; months would get long.",
+           "It is all in git already, that is the backup.", "Keep it, entries move between machines."]
 PR_TITLES = ["Add {date} entries", "Log updates for {date}", "Daily entries, {date}", "Update log for {date}"]
 ISSUE_TITLES = ["Entries for {date}", "Track {date} notes", "Log housekeeping, {date}", "Notes for {date}"]
 REVIEWS = ["Looks good.", "LGTM.", "Read through, nothing to change.", "Fine by me.", "Checked the entries, all good."]
@@ -61,6 +72,7 @@ LAST_TICK = ""
 _cfg_lock = threading.RLock()
 _work = threading.Lock()
 _me = {}
+_buddy = {}
 _cal = {}
 
 
@@ -241,17 +253,72 @@ def token(cfg):
     return r.stdout.strip()
 
 
-def gh(cfg, path, body=None, method=None):
+def gh(cfg, path, body=None, method=None, tok=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         API + path, data=data, method=method or ("POST" if data else "GET"),
-        headers={"Authorization": "Bearer " + token(cfg), "Accept": "application/vnd.github+json",
+        headers={"Authorization": "Bearer " + (tok or token(cfg)), "Accept": "application/vnd.github+json",
                  "Content-Type": "application/json", "User-Agent": "gapfree"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.load(r) if r.status != 204 else None
     except urllib.error.HTTPError as e:
         raise GHError(e.code, f"GitHub {e.code} on {path}: {e.read().decode()[:300]}") from None
+
+
+def gql(cfg, query, variables, tok=None):
+    r = gh(cfg, "/graphql", {"query": query, "variables": variables}, tok=tok)
+    if r.get("errors"):
+        raise RuntimeError(r["errors"][0]["message"])
+    return r["data"]
+
+
+def buddy(cfg):
+    """The second account, when one is configured: login and noreply address."""
+    if not cfg["buddy_token"]:
+        return None
+    if not _buddy:
+        u = gh(cfg, "/user", tok=cfg["buddy_token"])
+        _buddy.update(login=u["login"], email=f'{u["id"]}+{u["login"]}@users.noreply.github.com')
+    return _buddy
+
+
+def ensure_buddy(cfg):
+    """Make the buddy a collaborator on the repo, accepting the invitation on its behalf."""
+    b = buddy(cfg)
+    if not b:
+        return
+    try:
+        gh(cfg, f"/repos/{cfg['repo']}/collaborators/{b['login']}")
+        return
+    except GHError as e:
+        if e.code != 404:
+            raise
+    inv = gh(cfg, f"/repos/{cfg['repo']}/collaborators/{b['login']}", {"permission": "push"}, "PUT")
+    if inv and inv.get("id"):
+        gh(cfg, f"/user/repository_invitations/{inv['id']}", {}, "PATCH", tok=cfg["buddy_token"])
+    log(f"added {b['login']} as collaborator on {cfg['repo']}")
+
+
+def parse_badges(html):
+    out = {}
+    for chunk in re.split(r'alt="Achievement: ', html)[1:]:   # one chunk per badge, up to the next badge
+        name = chunk.split('"', 1)[0]
+        tier = re.search(r'achievement-tier-label[^>]*>\s*x(\d)', chunk)
+        out[name] = int(tier.group(1)) if tier else 1
+    return out
+
+
+def badges(cfg):
+    """Badges on the public profile page, name -> tier, cached 10 minutes."""
+    hit = _cal.get("badges")
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    req = urllib.request.Request(f"https://github.com/{me(cfg)['login']}?tab=achievements", headers={"User-Agent": "gapfree"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        out = parse_badges(r.read().decode())
+    _cal["badges"] = (time.time(), out)
+    return out
 
 
 def me(cfg):
@@ -361,7 +428,7 @@ def ours():
     return out
 
 
-def commit(cfg, date, minute, i):
+def commit(cfg, date, minute, i, trailer=""):
     path = os.path.join(REPO, "log", date[:4], date[5:] + ".md")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     new = not os.path.exists(path)
@@ -374,7 +441,7 @@ def commit(cfg, date, minute, i):
     msgs = cfg["messages"] or DEFAULTS["messages"]
     msg = msgs[int(fnv(date, seed(cfg, date[:4]), f"m{i}") * len(msgs))]
     git("add", "-A")
-    git("commit", "-q", "-m", msg, env=ident(cfg, when))
+    git("commit", "-q", "-m", msg + trailer, env=ident(cfg, when))
 
 
 def push_main():
@@ -394,7 +461,7 @@ def open_pr(cfg, title, branch, body):
         return prs[0]
 
 
-def merge_pr(cfg, date, g, prog):
+def merge_pr(cfg, date, g, prog, paired=False):
     """Push the group's commits as a branch, open a PR (reviewed when planned), rebase-merge it.
     Rebase keeps the author dates, so the commits still count on the day they are stamped with."""
     repo, s = cfg["repo"], seed(cfg, date[:4])
@@ -412,9 +479,10 @@ def merge_pr(cfg, date, g, prog):
             log(f"{date}: reviewed PR #{pr['number']}")
         except GHError as e:
             log(f"{date}: review skipped: {e}")
+    tok = cfg["buddy_token"] or None  # a buddy merging your PR is what Pull Shark wants; self-merges did not count
     for attempt in range(5):
         try:
-            gh(cfg, f"/repos/{repo}/pulls/{pr['number']}/merge", {"merge_method": "rebase"}, "PUT")
+            gh(cfg, f"/repos/{repo}/pulls/{pr['number']}/merge", {"merge_method": "rebase"}, "PUT", tok=tok)
             break
         except GHError:
             if attempt == 4:
@@ -429,8 +497,53 @@ def merge_pr(cfg, date, g, prog):
     prog["prs"][str(g["start"])] = pr["number"]
     if issue:
         prog["closing"].append(issue)
+    if tok:
+        cfg["farm"]["shark"] = cfg["farm"].get("shark", 0) + 1
+    if paired:
+        cfg["farm"]["pair"] = cfg["farm"].get("pair", 0) + 1
     save(cfg)
     log(f"{date}: merged PR #{pr['number']} with {g['end'] - g['start']} commits")
+
+
+def quickdraw(cfg):
+    repo = cfg["repo"]
+    n = gh(cfg, f"/repos/{repo}/issues", {"title": "Typo in the README", "body": "Already fixed, closing."})["number"]
+    gh(cfg, f"/repos/{repo}/issues/{n}", {"state": "closed"}, "PATCH")
+    cfg["farm"]["quickdraw"] = dt.date.today().isoformat()
+    save(cfg)
+    log(f"quickdraw: issue #{n} opened and closed")
+
+
+def galaxy(cfg, date):
+    """The buddy asks a Q&A question, this account answers, the buddy accepts: one Galaxy Brain step."""
+    repo, farm, s = cfg["repo"], cfg["farm"], seed(cfg, date[:4])
+    if not farm.get("qa"):
+        gh(cfg, f"/repos/{repo}", {"has_discussions": True}, "PATCH")
+        owner, name = repo.split("/")
+        r = gql(cfg, "query($o:String!,$n:String!){repository(owner:$o,name:$n){id discussionCategories(first:25){nodes{id isAnswerable}}}}",
+                {"o": owner, "n": name})["repository"]
+        cat = next((c["id"] for c in r["discussionCategories"]["nodes"] if c["isAnswerable"]), None)
+        if not cat:
+            raise RuntimeError("the repo has no Q&A discussion category")
+        farm["qa"] = [r["id"], cat]
+        save(cfg)
+    rid, cid = farm["qa"]
+    k = int(fnv(date, s, "gq") * len(QUESTIONS))
+    d = gql(cfg, "mutation($r:ID!,$c:ID!,$t:String!,$b:String!){createDiscussion(input:{repositoryId:$r,categoryId:$c,title:$t,body:$b}){discussion{id}}}",
+            {"r": rid, "c": cid, "t": QUESTIONS[k], "b": "Curious what others do."}, tok=cfg["buddy_token"])["createDiscussion"]["discussion"]["id"]
+    c = gql(cfg, "mutation($d:ID!,$b:String!){addDiscussionComment(input:{discussionId:$d,body:$b}){comment{id}}}",
+            {"d": d, "b": ANSWERS[k]})["addDiscussionComment"]["comment"]["id"]
+    gql(cfg, "mutation($c:ID!){markDiscussionCommentAsAnswer(input:{id:$c}){clientMutationId}}", {"c": c}, tok=cfg["buddy_token"])
+    farm["galaxy"] = farm.get("galaxy", 0) + 1
+    save(cfg)
+    log(f"{date}: answered a discussion ({farm['galaxy']}/32)")
+
+
+def farm_due(cfg, date, prog):
+    farm = cfg["farm"]
+    if cfg["quickdraw"] and not farm.get("quickdraw"):
+        return True
+    return bool(cfg["buddy_token"] and cfg["galaxy"] and farm.get("galaxy", 0) < 32 and not prog.get("galaxy"))
 
 
 def group_at(plan, i):
@@ -464,6 +577,8 @@ def due_today(cfg, date, done, now):
             return True
     if any(mi <= m for k, mi in enumerate(plan["issues"]) if str(k) not in prog.get("issues", {})):
         return True
+    if ts[0] <= m and farm_due(cfg, date, prog):
+        return True
     return bool(plan["issues"]) and done >= len(ts) and len(prog.get("issues", {})) == len(plan["issues"]) \
         and not prog.get("closed")
 
@@ -484,6 +599,14 @@ def sync_today(cfg, date, mine, now):
             prog["issues"][str(k)] = num
             save(cfg)
             log(f"{date}: opened issue #{num}")
+    if ts[0] <= m and farm_due(cfg, date, prog):
+        if cfg["quickdraw"] and not cfg["farm"].get("quickdraw"):
+            quickdraw(cfg)
+        if buddy(cfg) and cfg["galaxy"] and cfg["farm"].get("galaxy", 0) < 32 and not prog.get("galaxy"):
+            galaxy(cfg, date)
+            prog["galaxy"] = True
+            save(cfg)
+    b = buddy(cfg)
     i, n, dirty = mine.get(date, 0), 0, False
     while i < len(ts):
         g = group_at(plan, i)
@@ -493,9 +616,10 @@ def sync_today(cfg, date, mine, now):
             if dirty:
                 push_main()
                 dirty = False
+            paired = bool(b and cfg["pair"] and cfg["farm"].get("pair", 0) < 48)
             for j in range(i, g["end"]):
-                commit(cfg, date, ts[j], j)
-            merge_pr(cfg, date, g, prog)
+                commit(cfg, date, ts[j], j, f"\n\nCo-authored-by: {b['login']} <{b['email']}>" if paired and j == i else "")
+            merge_pr(cfg, date, g, prog, paired)
             n += g["end"] - i
             i = g["end"]
         else:
@@ -541,6 +665,10 @@ def tick(cfg):
         return 0
     with _work:
         ensure_repo(cfg)
+        try:
+            ensure_buddy(cfg)
+        except Exception as e:
+            log(f"buddy setup failed: {e}")
         mine = ours()
         n = sum(sync_past(cfg, d, mine) for d in days[:-1])
         if n:
@@ -618,10 +746,16 @@ def state(cfg, year):
             upcoming.append(dict(counts(plan), date=d.isoformat(), first=hhmm(plan["commits"][0]),
                                  last=hhmm(plan["commits"][-1])))
         d += dt.timedelta(1)
-    public = {k: v for k, v in cfg.items() if k not in ("token", "progress")}
+    public = {k: v for k, v in cfg.items() if k not in ("token", "buddy_token", "progress")}
     public["token_set"] = bool(cfg["token"])
+    try:
+        public["buddy"] = (buddy(cfg) or {}).get("login", "")
+        earned = badges(cfg) if login else {}
+    except Exception as e:
+        public["buddy"], earned = "", {}
+        err = err or str(e)
     return {"year": year, "today": today, "days": days, "login": login, "avatar": avatar, "created": created, "error": err,
-            "version": __version__,
+            "version": __version__, "badges": earned, "farm": cfg["farm"],
             "busy": BUSY, "service": SERVICE, "last_tick": LAST_TICK,
             "repo_ready": repo_ready() and bool(cfg["repo"]), "repo_commits": sum(mine.values()),
             "total": sum(v for k, v in cal.items() if k.startswith(str(year))),
@@ -686,12 +820,15 @@ def norm_repo(cfg, r):
 
 def set_settings(body):
     with _cfg_lock:
-        for k in ("repo", "tz", "hours", "density", "range", "weekends", "mix", "mix_auto", "messages"):
+        for k in ("repo", "tz", "hours", "density", "range", "weekends", "mix", "mix_auto", "messages", "quickdraw", "pair", "galaxy"):
             if k in body:
                 CFG[k] = body[k]
         if body.get("token"):
             CFG["token"] = body["token"].strip()
             _me.clear()
+        if "buddy_token" in body:
+            CFG["buddy_token"] = body["buddy_token"].strip()
+            _buddy.clear()
         CFG["repo"] = norm_repo(CFG, CFG["repo"])
         ZoneInfo(CFG["tz"])
         lo, hi = sorted(int(x) for x in CFG["range"])
@@ -939,9 +1076,18 @@ details.card summary{cursor:pointer;color:var(--mut);font-size:15px}
  <table id="upcoming"></table>
 </section>
 
+<section class="card">
+ <h2>Achievements</h2>
+ <p class="mut lead">Badges on your profile right now: <b id="badgelist"></b></p>
+ <table id="achtable"></table>
+ <div class="row"><label><input type="checkbox" id="quickdraw"> Quickdraw, once</label><label><input type="checkbox" id="pair"> Pair Extraordinaire</label><label><input type="checkbox" id="galaxy"> Galaxy Brain</label><span class="hint" id="buddyline"></span></div>
+ <p class="hint">Solo, this account earned Quickdraw and YOLO and nothing else: self-merged pull requests, self-co-authored commits and self-answered discussions were all ignored. Pull Shark, Pair Extraordinaire and Galaxy Brain need a second account you own. Put its token under Settings and gapfree invites it to the repo, lets it merge your pull requests, co-authors it on PR commits and has it ask the questions you answer. Everything stops at the top tier.</p>
+</section>
+
 <details class="card" id="settings"><summary>Settings</summary><div id="settings-body">
  <div class="row">
   <label>Token <input id="token" type="password" placeholder="blank = gh auth token" size="26"></label>
+  <label>Buddy token <input id="buddytoken" type="password" placeholder="second account, optional" size="24"></label><button id="forgetbuddy" hidden>Forget buddy</button>
   <label>Timezone <input id="tz" size="18"></label>
   <label>Hours <input type="number" id="h0" min="0" max="23"> to <input type="number" id="h1" min="1" max="24"></label>
  </div>
@@ -990,7 +1136,7 @@ function render() {
   $('tick').disabled = !!S.busy || !S.repo_ready;
   if (sel && selYear !== Y) { sel = null; }
   rangeLabel();
-  renderGrid(); renderMix(); renderAuto();
+  renderGrid(); renderMix(); renderAuto(); renderAch();
 }
 
 function renderGrid() {
@@ -1037,6 +1183,24 @@ function renderMix() {
   $('radarnote').innerHTML = `<span style="color:#39d353">green</span> target · <span style="color:#58a6ff">blue</span> this year: ${S.mix.commits} commits, ${S.mix.prs} PRs, ${S.mix.issues} issues, ${S.mix.reviews} reviews (public activity + repo + plan)`;
 }
 
+function renderAch() {
+  const s = S.settings, f = S.farm || {}, b = S.badges || {}, hasBuddy = !!s.buddy;
+  $('badgelist').textContent = Object.keys(b).length ? Object.entries(b).map(([k, t]) => k + (t > 1 ? ' x' + t : '')).join(', ') : 'none yet';
+  ['quickdraw', 'pair', 'galaxy'].forEach(k => $(k).checked = !!s[k]);
+  $('buddyline').textContent = hasBuddy ? `buddy: @${s.buddy}` : 'no buddy account set';
+  $('forgetbuddy').hidden = !hasBuddy;
+  const tier = (name, n) => { const t = ({'Pull Shark': [2, 16, 128, 1024], 'Pair Extraordinaire': [1, 10, 24, 48], 'Galaxy Brain': [2, 8, 16, 32]})[name]; const next = t.find(x => x > n); return next ? `${n}/${next} toward the next tier` : `${n}, top tier reached`; };
+  const rows = [
+    ['Quickdraw', 'close an issue within 5 minutes of opening', b['Quickdraw'] ? 'earned' : f.quickdraw ? 'done ' + f.quickdraw + ', waiting for GitHub' : s.quickdraw ? 'on the next active day' : 'off'],
+    ['YOLO', 'merge a pull request without a review', b['YOLO'] ? 'earned' : 'happens whenever a PR ships unreviewed'],
+    ['Pull Shark', 'pull requests merged by someone else, 2 / 16 / 128 / 1024', b['Pull Shark'] ? 'earned x' + b['Pull Shark'] + ', ' + tier('Pull Shark', f.shark || 0) : hasBuddy ? tier('Pull Shark', f.shark || 0) + ' (buddy merges)' : 'needs a buddy'],
+    ['Pair Extraordinaire', 'PRs with a co-authored commit, 1 / 10 / 24 / 48', b['Pair Extraordinaire'] ? 'earned x' + b['Pair Extraordinaire'] : hasBuddy && s.pair ? tier('Pair Extraordinaire', f.pair || 0) : hasBuddy ? 'off' : 'needs a buddy'],
+    ['Galaxy Brain', 'answered discussions with accepted answers, 2 / 8 / 16 / 32', b['Galaxy Brain'] ? 'earned x' + b['Galaxy Brain'] : hasBuddy && s.galaxy ? tier('Galaxy Brain', f.galaxy || 0) : hasBuddy ? 'off' : 'needs a buddy'],
+    ['Starstruck', '16 stars on one repo', b['Starstruck'] ? 'earned' : 'not something a log repo can do'],
+  ];
+  $('achtable').innerHTML = '<tr><th>Badge</th><th>How</th><th>Status</th></tr>' + rows.map(r => `<tr><td style="color:var(--fg)">${r[0]}</td><td>${r[1]}</td><td class="${/earned/.test(r[2]) ? 'ok' : ''}">${r[2]}</td></tr>`).join('');
+}
+
 function renderAuto() {
   const s = S.settings;
   $('autostatus').textContent = s.forward ? `on since ${s.forward_since}${S.last_tick ? ', last pass ' + S.last_tick : ''}` : 'off';
@@ -1076,15 +1240,18 @@ function settings() {
   const lo = +$('lo').value, hi = +$('hi').value;
   return {density: +$('density').value, range: [Math.min(lo, hi), Math.max(lo, hi)], weekends: $('weekends').checked,
     tz: $('tz').value, hours: [+$('h0').value, +$('h1').value],
-    messages: $('messages').value.split('\n').map(x => x.trim()).filter(Boolean), token: $('token').value};
+    messages: $('messages').value.split('\n').map(x => x.trim()).filter(Boolean), token: $('token').value,
+    ...($('buddytoken').value ? {buddy_token: $('buddytoken').value} : {})};
 }
-const saveSettings = () => api('/api/settings', settings()).then(() => { $('token').value = ''; load(); }).catch(fail);
+const saveSettings = () => api('/api/settings', settings()).then(() => { $('token').value = ''; $('buddytoken').value = ''; load(); }).catch(fail);
 ['density', 'lo', 'hi'].forEach(id => $(id).oninput = () => {
   $('densityv').textContent = $('density').value + '%';
   $('rangev').textContent = Math.min($('lo').value, $('hi').value) + '–' + Math.max($('lo').value, $('hi').value);
   clearTimeout(timer); timer = setTimeout(saveSettings, 150);
 });
 $('weekends').onchange = saveSettings;
+['quickdraw', 'pair', 'galaxy'].forEach(k => $(k).onchange = () => api('/api/settings', {[k]: $(k).checked}).then(load).catch(fail));
+$('forgetbuddy').onclick = () => api('/api/settings', {buddy_token: ''}).then(load).catch(fail);
 $('save').onclick = saveSettings;
 $('prev').onclick = () => { Y--; load(); };
 $('next').onclick = () => { Y++; load(); };
