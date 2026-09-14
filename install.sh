@@ -29,7 +29,7 @@ Darwin)
 <plist version="1.0"><dict>
  <key>Label</key><string>sh.gapfree</string>
  <key>ProgramArguments</key><array><string>$PY</string><string>$HOME_DIR/gapfree.py</string><string>serve</string></array>
- <key>EnvironmentVariables</key><dict><key>PATH</key><string>$PATH_LINE</string><key>GAPFREE_HOME</key><string>$HOME_DIR</string><key>GAPFREE_PORT</key><string>$PORT</string></dict>
+ <key>EnvironmentVariables</key><dict><key>PATH</key><string>$PATH_LINE</string><key>GAPFREE_HOME</key><string>$HOME_DIR</string><key>GAPFREE_PORT</key><string>$PORT</string><key>GAPFREE_SERVICE</key><string>launchd</string></dict>
  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
  <key>StandardOutPath</key><string>$HOME_DIR/service.log</string><key>StandardErrorPath</key><string>$HOME_DIR/service.log</string>
 </dict></plist>
@@ -38,7 +38,25 @@ PL
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
   ;;
 Linux)
-  if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
+  if [ "$(id -u)" = 0 ] && command -v systemctl >/dev/null; then
+    # root on a server or container: a system unit, no user session needed
+    cat > /etc/systemd/system/gapfree.service <<SV
+[Unit]
+Description=gapfree
+After=network-online.target
+Wants=network-online.target
+[Service]
+ExecStart=$PY $HOME_DIR/gapfree.py serve
+Environment=PATH=$PATH_LINE GAPFREE_HOME=$HOME_DIR GAPFREE_PORT=$PORT GAPFREE_SERVICE=systemd GAPFREE_BIND=${GAPFREE_BIND:-127.0.0.1}
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+SV
+    systemctl daemon-reload
+    systemctl enable --now gapfree
+    systemctl restart gapfree
+  elif command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
     mkdir -p "$HOME/.config/systemd/user"
     cat > "$HOME/.config/systemd/user/gapfree.service" <<SV
 [Unit]
@@ -46,7 +64,7 @@ Description=gapfree
 After=network-online.target
 [Service]
 ExecStart=$PY $HOME_DIR/gapfree.py serve
-Environment=PATH=$PATH_LINE GAPFREE_HOME=$HOME_DIR GAPFREE_PORT=$PORT
+Environment=PATH=$PATH_LINE GAPFREE_HOME=$HOME_DIR GAPFREE_PORT=$PORT GAPFREE_SERVICE=systemd
 Restart=always
 [Install]
 WantedBy=default.target
@@ -55,8 +73,8 @@ SV
     systemctl --user enable --now gapfree
     loginctl enable-linger "$(id -un)" 2>/dev/null || true
   else
-    ( crontab -l 2>/dev/null | grep -v gapfree.py; echo "@reboot cd $HOME_DIR && nohup $PY gapfree.py serve >> service.log 2>&1 &" ) | crontab -
-    cd "$HOME_DIR" && nohup "$PY" gapfree.py serve >> service.log 2>&1 &
+    ( crontab -l 2>/dev/null | grep -v gapfree.py; echo "@reboot cd $HOME_DIR && GAPFREE_SERVICE=cron nohup $PY gapfree.py serve >> service.log 2>&1 &" ) | crontab -
+    cd "$HOME_DIR" && GAPFREE_SERVICE=cron nohup "$PY" gapfree.py serve >> service.log 2>&1 &
   fi
   ;;
 *)
@@ -66,5 +84,6 @@ esac
 
 URL="http://localhost:$PORT"
 echo "gapfree is running at $URL"
-echo "Open it, put a repo name (owner/name) in Settings and, if you do not use the gh CLI, a GitHub token with repo scope."
+echo "Open it and press Publish to create the private activity repo (or pick one you already have)."
+echo "If the gh CLI is not logged in on this machine, paste a GitHub token with repo scope under Settings first."
 command -v open >/dev/null && open "$URL" 2>/dev/null || command -v xdg-open >/dev/null && xdg-open "$URL" 2>/dev/null || true

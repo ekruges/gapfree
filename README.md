@@ -3,19 +3,18 @@
 Free, self-hosted filler for the GitHub contribution graph. One Python file,
 no dependencies beyond `python3` and `git`.
 
-It does what gapless.sh sells for $2 a month, using the same planning
-arithmetic, and adds the parts that service skips: it keeps the plan running
-on your own machine forever, and it can open issues and pull requests and
-leave reviews so every contribution type on the profile fills in, not only
-the commit squares.
+It does what gapless.sh sells for $2 a month, with the same planning
+arithmetic for the commit squares, and adds what that service skips: a mix
+of pull requests, issues and reviews so the activity overview on your
+profile fills in too, a scheduler that keeps the plan running on your own
+machine for good, and a one-click private repo to put it all in.
 
-Everything lands in one private repo you own (created for you if missing).
-Each commit appends one line to `log/YYYY/MM-DD.md`, so the history stays
-inspectable and easy to delete.
+Every commit appends one line to `log/YYYY/MM-DD.md` in that repo, so the
+history stays inspectable and easy to delete.
 
 ## Install
 
-Anything with `python3` (3.9+) and `git`. A Raspberry Pi, a 256 MB LXC, your
+Anything with `python3` (3.9+) and `git`: a Raspberry Pi, a 256 MB LXC, your
 laptop.
 
 ```sh
@@ -37,58 +36,82 @@ Or just run it:
 python3 gapfree.py serve
 ```
 
-## Setup
+## First run
 
-1. Open http://localhost:7331 and expand Settings.
-2. Repo: `owner/name`. It is created as a private repo if it does not exist.
-   Using an existing repo is fine; gapfree only appends commits.
-3. Token: leave blank if the `gh` CLI is logged in on that machine. Otherwise
-   paste a token with `repo` scope (classic) or Contents, Issues and Pull
-   requests write access on that one repo (fine-grained).
-4. Turn on "Include private contributions" on your GitHub profile
-   (Contribution settings on the profile page), or the private repo's activity
-   stays hidden.
+1. Open http://localhost:7331. If the `gh` CLI is logged in on that machine
+   you are already connected. Otherwise paste a token under Settings:
+   `repo` scope (classic) or Contents, Issues and Pull requests write access
+   on the one repo (fine-grained).
+2. Repository card: press Publish. A private `activity-log` repo is created
+   with a README and the log layout shown in the preview. Or switch to
+   "Existing repo" and pick one you already have; gapfree only appends to
+   `log/` in it.
+3. Turn on "Include private contributions" on your GitHub profile
+   (Contribution settings on the profile page), or the private repo's
+   activity stays hidden.
 
-The UI binds to localhost only. If you want it reachable elsewhere, put
-Tailscale or an authenticating proxy in front of it. There is no login.
+The UI binds to localhost only. To reach it from elsewhere, put Tailscale or
+an authenticating proxy in front of it. There is no login.
 
-## What the sliders do
+## The knobs
 
 The plan is deterministic: every year has a random seed, and each day is
 hashed with that seed (FNV-1a over `date:tag`, the arithmetic gapless.sh
-ships in its bundle). Change a slider and the same days move, so the preview
-is exactly what gets pushed.
+ships in its bundle). Change a slider and the same days move, so the
+preview is exactly what gets pushed.
+
+Contribution graph
 
 - Density: share of days that get commits. Weekends run at 40% of it.
 - Commits/day: each active day draws uniformly from the range.
-- Include weekends: off means Saturday and Sunday stay empty.
-- Issues: share of active days that also open an issue (closed at the end of the day).
-- Pull requests: share of active days whose commits arrive on a branch, get
-  merged through a PR, and, with "Review each PR", get a review comment first.
-- Hours: window the commits are timestamped in. One random start, then a
-  constant gap of 3 to 12 minutes between commits, which is what real
-  gapless output looks like.
-- Randomize: new seed for the shown year.
+- Weekends: off keeps Saturday and Sunday empty.
+- Randomize year: new seed for the shown year.
 - Click any square to pin its count (0 keeps it empty, blank returns it to automatic).
 
-Days that already have real activity are never touched by a backfill.
+Activity mix
 
-## Backfill and the daily run
+Four linked sliders, the shares GitHub's activity overview shows: commits,
+pull requests, issues, code review. Move one and the rest give way
+proportionally. The radar shows the target in green and what the year adds
+up to in blue (your public activity, what is in the repo, and the plan).
 
-"Backfill past dates" pushes every planned commit for the shown year, dated
-to their planned minutes. "Keep committing every day" makes the service
-commit today's plan at the planned times, day after day. If the machine was
-off, the next run catches up the missed days.
+Not sure what shape to pick? "Shuffle a balanced shape" draws one a real
+profile could have (commits lead, pull requests next, reviews a share of
+those). "Fresh shape every year" derives the mix from each year's seed
+instead of the sliders, so the overview changes a little from year to year
+without anyone touching it.
 
-Issues, PRs and reviews cannot be backdated (GitHub stamps them at creation),
-so they only happen on the day itself while the daily run is on.
+Per active day the mix sets how many extras ride along with the commits:
+some commit slices (one to three commits) go out on a branch and get
+rebase-merged through a pull request, some of those pull requests get a
+review comment first, and issues open during the day and close at the end.
+GitHub credits one review per pull request, so reviews never exceed PRs.
+
+Timing: one random start inside the hours window, then a constant gap of 3
+to 12 minutes between commits, which is what real gapless output looks like.
+
+## Fill a period
+
+Pick a date range (presets: this year, last year, last 12 months) and press
+Backfill. Every past day in the range that is still empty (nothing of yours,
+nothing in the repo) gets its planned commits, dated to their planned minutes. Issues, PRs and
+reviews cannot be backdated (GitHub stamps them at creation), so past days
+get commits only.
+
+## Automation
+
+"Keep committing every day" makes the service run today's plan at the
+planned minutes, open and close the issues, merge the pull requests, and
+carry on into the next year with a fresh seed. If the machine was off, the
+next pass catches up the missed days (commits only). The Automation card
+shows the service it runs under and the next planned days.
 
 Cron users can skip the service and run `python3 gapfree.py tick` every few
-minutes instead; the web UI is still needed once to set things up.
+minutes; the web UI is still needed once for setup.
 
 ## Files
 
-- `~/.gapfree/config.json`: settings, seeds, overrides (mode 600).
+- `~/.gapfree/config.json`: settings, seeds, overrides, issue and PR numbers per day (mode 600).
 - `~/.gapfree/repo`: local clone of the activity repo.
 - `~/.gapfree/gapfree.log`: what was pushed and when.
 
@@ -100,4 +123,5 @@ minutes instead; the web UI is still needed once to set things up.
 python3 test_gapfree.py
 ```
 
-Fails if the planner drifts from the reference values taken from gapless.sh.
+Fails if the planner drifts from the reference values taken from gapless.sh
+or the mix stops adding up.
