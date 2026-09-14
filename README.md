@@ -44,15 +44,26 @@ a 2 GB disk are plenty.
 
 ## First run
 
-1. Open http://localhost:7331. If the `gh` CLI is logged in on that machine
-   you are already connected. Otherwise paste a token under Settings:
-   `repo` scope (classic) or Contents, Issues and Pull requests write access
-   on the one repo (fine-grained).
-2. Repository card: press Publish. A private `activity-log` repo is created
-   with a README and the log layout shown in the preview. Or switch to
-   "Existing repo" and pick one you already have; gapfree only appends to
-   `log/` in it.
-3. Turn on "Include private contributions" on your GitHub profile
+The installer ends in `gapfree setup`, which you can rerun any time:
+
+```sh
+gapfree setup
+```
+
+It logs you in through the GitHub CLI (a device code, so it works on a
+headless box: open the link on any device and type the code), asks whether
+you have a second account for the badges (log in to it, or it opens the
+signup page and waits), picks the repo, and restarts the service. No tokens
+to copy. Without the CLI, paste tokens under Settings instead: `repo` scope
+(classic). The second account's token has to be classic too, because a
+fine-grained token cannot be scoped to a repo another user owns.
+
+Then:
+
+1. Open http://localhost:7331. Repository card: press Publish for a fresh
+   private `activity-log` repo, or pick an existing one under "Existing
+   repo"; gapfree only appends to `log/` in it.
+2. Turn on "Include private contributions" on your GitHub profile
    (Contribution settings on the profile page), or the private repo's
    activity stays hidden.
 
@@ -126,7 +137,10 @@ repo, so Pull Shark, Pair Extraordinaire and Galaxy Brain need a second
 account you own. Put that account's token under Settings as the buddy:
 gapfree invites it to the repo, lets it merge your pull requests, adds it as
 co-author on PR commits, and has it ask the Q&A questions you answer and
-accept. Each stops at its top tier.
+accept. Each stops at its top tier. "Earn the badges now" (or `gapfree
+badges`) does the first two merged PRs, the co-authored commit and two
+answered discussions immediately, so you can confirm the badges land
+instead of waiting for the daily run to get there.
 
 ## Files
 

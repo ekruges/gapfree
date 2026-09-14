@@ -10,6 +10,19 @@ command -v python3 >/dev/null || { echo "gapfree needs python3 (3.9 or newer)"; 
 command -v git >/dev/null || { echo "gapfree needs git"; exit 1; }
 python3 -c 'import zoneinfo' 2>/dev/null || { echo "python3 is too old (need 3.9+)"; exit 1; }
 
+# the GitHub CLI does the account logins (device code, works headless)
+if ! command -v gh >/dev/null; then
+  if command -v apt-get >/dev/null && [ "$(id -u)" = 0 ]; then
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
+    apt-get -qq update >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get -qq install -y gh >/dev/null
+  elif command -v brew >/dev/null; then
+    brew install -q gh
+  else
+    echo "Install the GitHub CLI (https://cli.github.com) to log accounts in, or paste tokens in Settings."
+  fi
+fi
+
 mkdir -p "$HOME_DIR" && chmod 700 "$HOME_DIR"
 if [ -f "$(dirname "$0")/gapfree.py" ]; then
   cp "$(dirname "$0")/gapfree.py" "$HOME_DIR/gapfree.py"
@@ -82,8 +95,17 @@ SV
   ;;
 esac
 
+# `gapfree setup` / `gapfree badges` from anywhere
+BIN="$( [ "$(id -u)" = 0 ] && echo /usr/local/bin || echo "$HOME/.local/bin" )"
+mkdir -p "$BIN" && printf '#!/bin/sh\nexec "%s" "%s/gapfree.py" "$@"\n' "$PY" "$HOME_DIR" > "$BIN/gapfree" && chmod +x "$BIN/gapfree"
+
 URL="http://localhost:$PORT"
 echo "gapfree is running at $URL"
 echo "Open it and press Publish to create the private activity repo (or pick one you already have)."
 echo "If the gh CLI is not logged in on this machine, paste a GitHub token with repo scope under Settings first."
 command -v open >/dev/null && open "$URL" 2>/dev/null || command -v xdg-open >/dev/null && xdg-open "$URL" 2>/dev/null || true
+if [ -t 0 ] && [ -z "$GAPFREE_NO_SETUP" ]; then
+  echo; "$PY" "$HOME_DIR/gapfree.py" setup
+else
+  echo "Run  gapfree setup  to log the accounts in (main plus an optional second one for the badges)."
+fi

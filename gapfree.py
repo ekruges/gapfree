@@ -6,7 +6,9 @@ requests, issues and reviews (the same seeded hash gapless.sh uses for the
 commit squares), backfills past dates, and keeps going every day while it
 runs.
 
+    python3 gapfree.py setup                        log in the main and buddy accounts, pick the repo
     python3 gapfree.py serve                        web UI + scheduler on http://localhost:7331
+    python3 gapfree.py badges                       earn the buddy badges right now instead of over the coming days
     python3 gapfree.py tick                         one scheduler pass (for cron)
     python3 gapfree.py backfill 2024-01-01 2024-12-31 [--before-creation]
 """
@@ -14,6 +16,7 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -21,10 +24,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 HOME = os.environ.get("GAPFREE_HOME") or os.path.expanduser("~/.gapfree")
 CONFIG = os.path.join(HOME, "config.json")
@@ -309,15 +313,16 @@ def parse_badges(html):
     return out
 
 
-def badges(cfg):
-    """Badges on the public profile page, name -> tier, cached 10 minutes."""
-    hit = _cal.get("badges")
+def badges(cfg, login=None):
+    """Badges on a public profile page, name -> tier, cached 10 minutes."""
+    login = login or me(cfg)["login"]
+    hit = _cal.get(("badges", login))
     if hit and time.time() - hit[0] < 600:
         return hit[1]
-    req = urllib.request.Request(f"https://github.com/{me(cfg)['login']}?tab=achievements", headers={"User-Agent": "gapfree"})
+    req = urllib.request.Request(f"https://github.com/{login}?tab=achievements", headers={"User-Agent": "gapfree"})
     with urllib.request.urlopen(req, timeout=30) as r:
         out = parse_badges(r.read().decode())
-    _cal["badges"] = (time.time(), out)
+    _cal[("badges", login)] = (time.time(), out)
     return out
 
 
@@ -539,6 +544,30 @@ def galaxy(cfg, date):
     log(f"{date}: answered a discussion ({farm['galaxy']}/32)")
 
 
+def farm_now(cfg):
+    """Everything a buddy makes possible, right away: two PRs merged by the buddy with a co-authored
+    commit (Pull Shark, Pair Extraordinaire), two answered discussions (Galaxy Brain), Quickdraw once."""
+    with _work:
+        ensure_repo(cfg)
+        ensure_buddy(cfg)
+        b = buddy(cfg)
+        if not b:
+            raise RuntimeError("no buddy account set")
+        now = dt.datetime.now(zone(cfg))
+        date, m = now.date().isoformat(), now.hour * 60 + now.minute
+        prog = cfg["progress"].setdefault(date, {"issues": {}, "prs": {}, "reviews": 0})
+        if cfg["quickdraw"] and not cfg["farm"].get("quickdraw"):
+            quickdraw(cfg)
+        for k in range(2):
+            push_main()
+            commit(cfg, date, m, 100 + k, f"\n\nCo-authored-by: {b['login']} <{b['email']}>")
+            merge_pr(cfg, date, {"start": 100 + k, "end": 101 + k, "review": False}, prog, paired=True)
+        for k in range(2):
+            galaxy(cfg, date)
+        _cal.clear()
+        log("badge run done; GitHub usually shows new badges within a few minutes")
+
+
 def farm_due(cfg, date, prog):
     farm = cfg["farm"]
     if cfg["quickdraw"] and not farm.get("quickdraw"):
@@ -702,6 +731,73 @@ def backfill(cfg, start, end, before_creation=False):
         _cal.clear()
         log(f"backfill {start} to {end}: {n} commits pushed")
         return n
+
+
+# ---------------------------------------------------------------- setup
+
+def gh_users():
+    """Accounts the GitHub CLI is logged into on this machine."""
+    r = subprocess.run(["gh", "auth", "status", "--hostname", "github.com"], capture_output=True, text=True)
+    return re.findall(r"account (\S+)", r.stdout + r.stderr)
+
+
+def gh_login():
+    """Interactive CLI login; the device code works on a headless box. Returns the login it added."""
+    before = set(gh_users())
+    subprocess.run(["gh", "auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--web",
+                    "--scopes", "repo"], check=True)
+    new = [u for u in gh_users() if u not in before]
+    return new[0] if new else (gh_users() or [""])[0]
+
+
+def gh_token(user):
+    r = subprocess.run(["gh", "auth", "token", "--hostname", "github.com", "--user", user], capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def setup(cfg):
+    """Walk through accounts and repo in the terminal, then hand the result to the running service."""
+    print(f"gapfree {__version__} setup\n")
+    if not shutil.which("gh"):
+        print("The GitHub CLI is missing. Install it from https://cli.github.com and run this again.")
+        return
+    users = gh_users()
+    main = users[0] if users else ""
+    if not main or input(f"Main account: keep @{main}? [Y/n] ").strip().lower() in ("n", "no"):
+        print("Log in to the account whose graph gets filled.")
+        main = gh_login()
+    cfg["token"] = gh_token(main)
+    print(f"Main account: @{main}\n")
+    print("A second account you own unlocks Pull Shark, Pair Extraordinaire and Galaxy Brain.")
+    ans = input("  [y] log in to one I already have   [n] create one now   [s] skip\n  > ").strip().lower()
+    if ans in ("y", "n"):
+        if ans == "n":
+            url = "https://github.com/signup"
+            print(f"Create the account at {url} (sign out of the main one first, or use a private window).")
+            webbrowser.open(url)
+            input("Press Enter once it exists. ")
+        print("Log in to the second account; the device code lets you finish in any browser.")
+        b = gh_login()
+        if not b or b == main:
+            print("That was the main account again; no buddy set.")
+        else:
+            cfg["buddy_token"] = gh_token(b)
+            _buddy.clear()
+            print(f"Buddy: @{b}")
+        subprocess.run(["gh", "auth", "switch", "--hostname", "github.com", "--user", main], capture_output=True)
+    if not cfg["repo"]:
+        cfg["repo"] = norm_repo(cfg, input("\nRepo for the log [activity-log]: ").strip() or "activity-log")
+    save(cfg)
+    _me.clear()
+    ensure_repo(cfg)
+    ensure_buddy(cfg)
+    print(f"\nRepo: {cfg['repo']} ({sum(ours().values())} commits)")
+    for cmd in (["systemctl", "restart", "gapfree"], ["systemctl", "--user", "restart", "gapfree"],
+                ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/sh.gapfree"]):
+        if subprocess.run(cmd, capture_output=True).returncode == 0:
+            print("Service restarted.")
+            break
+    print(f"Open the UI on port {PORT}." + (" Press 'Earn the badges now' under Achievements to confirm the buddy flow." if cfg["buddy_token"] else ""))
 
 
 # ---------------------------------------------------------------- web
@@ -888,6 +984,7 @@ ACTIONS = {
     "/api/backfill": lambda b: (backfill(CFG, b["from"], b["to"], b.get("before_creation")) if b.get("check") else
                                 run_bg(f"backfill {b['from']} to {b['to']}", lambda: backfill(CFG, b["from"], b["to"], b.get("before_creation")))),
     "/api/tick": lambda b: run_bg("tick", lambda: tick(CFG)),
+    "/api/farm": lambda b: run_bg("badge run", lambda: farm_now(CFG)),
 }
 
 
@@ -1080,7 +1177,7 @@ details.card summary{cursor:pointer;color:var(--mut);font-size:15px}
  <h2>Achievements</h2>
  <p class="mut lead">Badges on your profile right now: <b id="badgelist"></b></p>
  <table id="achtable"></table>
- <div class="row"><label><input type="checkbox" id="quickdraw"> Quickdraw, once</label><label><input type="checkbox" id="pair"> Pair Extraordinaire</label><label><input type="checkbox" id="galaxy"> Galaxy Brain</label><span class="hint" id="buddyline"></span></div>
+ <div class="row"><label><input type="checkbox" id="quickdraw"> Quickdraw, once</label><label><input type="checkbox" id="pair"> Pair Extraordinaire</label><label><input type="checkbox" id="galaxy"> Galaxy Brain</label><span class="hint" id="buddyline"></span><button id="farmnow" hidden>Earn the badges now</button></div>
  <p class="hint">Solo, this account earned Quickdraw and YOLO and nothing else: self-merged pull requests, self-co-authored commits and self-answered discussions were all ignored. Pull Shark, Pair Extraordinaire and Galaxy Brain need a second account you own. Put its token under Settings and gapfree invites it to the repo, lets it merge your pull requests, co-authors it on PR commits and has it ask the questions you answer. Everything stops at the top tier.</p>
 </section>
 
@@ -1188,7 +1285,7 @@ function renderAch() {
   $('badgelist').textContent = Object.keys(b).length ? Object.entries(b).map(([k, t]) => k + (t > 1 ? ' x' + t : '')).join(', ') : 'none yet';
   ['quickdraw', 'pair', 'galaxy'].forEach(k => $(k).checked = !!s[k]);
   $('buddyline').textContent = hasBuddy ? `buddy: @${s.buddy}` : 'no buddy account set';
-  $('forgetbuddy').hidden = !hasBuddy;
+  $('forgetbuddy').hidden = !hasBuddy; $('farmnow').hidden = !hasBuddy; $('farmnow').disabled = !!S.busy;
   const tier = (name, n) => { const t = ({'Pull Shark': [2, 16, 128, 1024], 'Pair Extraordinaire': [1, 10, 24, 48], 'Galaxy Brain': [2, 8, 16, 32]})[name]; const next = t.find(x => x > n); return next ? `${n}/${next} toward the next tier` : `${n}, top tier reached`; };
   const rows = [
     ['Quickdraw', 'close an issue within 5 minutes of opening', b['Quickdraw'] ? 'earned' : f.quickdraw ? 'done ' + f.quickdraw + ', waiting for GitHub' : s.quickdraw ? 'on the next active day' : 'off'],
@@ -1252,6 +1349,7 @@ const saveSettings = () => api('/api/settings', settings()).then(() => { $('toke
 $('weekends').onchange = saveSettings;
 ['quickdraw', 'pair', 'galaxy'].forEach(k => $(k).onchange = () => api('/api/settings', {[k]: $(k).checked}).then(load).catch(fail));
 $('forgetbuddy').onclick = () => api('/api/settings', {buddy_token: ''}).then(load).catch(fail);
+$('farmnow').onclick = () => { if (confirm(`Right now: two pull requests merged by @${S.settings.buddy} with a co-authored commit, two answered Q&A discussions, and Quickdraw if not done. Go?`)) api('/api/farm', {}).then(load).catch(fail); };
 $('save').onclick = saveSettings;
 $('prev').onclick = () => { Y--; load(); };
 $('next').onclick = () => { Y++; load(); };
@@ -1351,6 +1449,10 @@ if __name__ == "__main__":
         serve()
     elif cmd[0] == "version":
         print(__version__)
+    elif cmd[0] == "setup":
+        setup(CFG)
+    elif cmd[0] == "badges":
+        farm_now(CFG)
     elif cmd[0] == "tick":
         print(tick(CFG), "commits")
     elif cmd[0] == "backfill" and len(cmd) > 2:
