@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 (2026-09-14)
+
+- Each answered discussion asks a different question.
+
 ## 0.2.0 (2026-09-14)
 
 - `gapfree setup`: guided login for the main account and an optional second one through the GitHub CLI device code, signup page opened when a new account is needed, repo choice, service restart. The installer runs it at the end and installs the CLI when missing.

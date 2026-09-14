@@ -28,7 +28,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 HOME = os.environ.get("GAPFREE_HOME") or os.path.expanduser("~/.gapfree")
 CONFIG = os.path.join(HOME, "config.json")
