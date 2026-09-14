@@ -533,7 +533,7 @@ def galaxy(cfg, date):
         farm["qa"] = [r["id"], cat]
         save(cfg)
     rid, cid = farm["qa"]
-    k = int(fnv(date, s, "gq") * len(QUESTIONS))
+    k = int(fnv(date, s, f"gq{farm.get('galaxy', 0)}") * len(QUESTIONS))  # a different question each time
     d = gql(cfg, "mutation($r:ID!,$c:ID!,$t:String!,$b:String!){createDiscussion(input:{repositoryId:$r,categoryId:$c,title:$t,body:$b}){discussion{id}}}",
             {"r": rid, "c": cid, "t": QUESTIONS[k], "b": "Curious what others do."}, tok=cfg["buddy_token"])["createDiscussion"]["discussion"]["id"]
     c = gql(cfg, "mutation($d:ID!,$b:String!){addDiscussionComment(input:{discussionId:$d,body:$b}){comment{id}}}",
