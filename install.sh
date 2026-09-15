@@ -1,5 +1,5 @@
 #!/bin/sh
-# gapfree installer: drops gapfree.py in ~/.gapfree and keeps it running as a user service.
+# gapfree installer: puts gapfree.py in ~/.gapfree, keeps it running across reboots, then runs setup.
 #   curl -fsSL https://raw.githubusercontent.com/ekruges/gapfree/main/install.sh | sh
 set -e
 HOME_DIR="${GAPFREE_HOME:-$HOME/.gapfree}"
@@ -95,17 +95,16 @@ SV
   ;;
 esac
 
-# `gapfree setup` / `gapfree badges` from anywhere
+# `gapfree setup` from anywhere
 BIN="$( [ "$(id -u)" = 0 ] && echo /usr/local/bin || echo "$HOME/.local/bin" )"
 mkdir -p "$BIN" && printf '#!/bin/sh\nexec "%s" "%s/gapfree.py" "$@"\n' "$PY" "$HOME_DIR" > "$BIN/gapfree" && chmod +x "$BIN/gapfree"
 
 URL="http://localhost:$PORT"
 echo "gapfree is running at $URL"
-echo "Open it and press Publish to create the private activity repo (or pick one you already have)."
-echo "If the gh CLI is not logged in on this machine, paste a GitHub token with repo scope under Settings first."
 command -v open >/dev/null && open "$URL" 2>/dev/null || command -v xdg-open >/dev/null && xdg-open "$URL" 2>/dev/null || true
-if [ -t 0 ] && [ -z "$GAPFREE_NO_SETUP" ]; then
-  echo; "$PY" "$HOME_DIR/gapfree.py" setup
+# curl | sh leaves stdin on the pipe, so the questions read from the terminal directly
+if [ -z "$GAPFREE_NO_SETUP" ] && [ -e /dev/tty ]; then
+  echo; "$PY" "$HOME_DIR/gapfree.py" setup < /dev/tty
 else
-  echo "Run  gapfree setup  to log the accounts in (main plus an optional second one for the badges)."
+  echo "Run  gapfree setup  to log in and pick the repo."
 fi
