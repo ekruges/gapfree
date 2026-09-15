@@ -6,6 +6,8 @@ There is a service that charges $2 a month to run a hash function and
 `git commit` on a schedule. This is the hash function and `git commit`.
 It should not be a paid service, so it is not one.
 
+![gapfree web UI](docs/screenshot.png)
+
 ## Install
 
 Mac, Linux, a Raspberry Pi, a 256 MB container in your homelab, whatever
