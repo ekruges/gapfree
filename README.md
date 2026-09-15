@@ -18,7 +18,7 @@ curl -fsSL https://raw.githubusercontent.com/ekruges/gapfree/main/install.sh | s
 It installs itself as a service that survives reboots, then asks you two
 things: which GitHub account (a device code, you approve it in any browser)
 and what to call the private repo the commits go into. Then it opens
-http://localhost:7331. That is the whole setup.
+http://localhost:7331.
 
 Docker, if that is your thing:
 
