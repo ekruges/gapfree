@@ -9,6 +9,7 @@ runs. This should not be a paid service.
     python3 gapfree.py setup                        log in with the GitHub CLI and pick the repo
     python3 gapfree.py serve                        web UI + scheduler on http://localhost:7331
     python3 gapfree.py tick                         one scheduler pass (for cron)
+    python3 gapfree.py balance 2026                 create the PRs, issues and reviews the mix implies for a year, now
     python3 gapfree.py backfill 2024-01-01 2024-12-31 [--before-creation]
 """
 import datetime as dt
@@ -54,9 +55,14 @@ DEFAULTS = {
     "forward": False,            # keep committing every day
     "forward_since": "",         # first day the scheduler is responsible for
     "topup": False,              # backfill may add commits to days gapfree itself filled earlier
+    "balance_rate": 300,         # objects an hour while balancing a year in bulk
 }
+PR_TITLES = ["Add {date} entries", "Log updates for {date}", "Daily entries, {date}", "Update log for {date}"]
+ISSUE_TITLES = ["Entries for {date}", "Track {date} notes", "Log housekeeping, {date}", "Notes for {date}"]
+REVIEWS = ["Looks good.", "LGTM.", "Read through, nothing to change.", "Fine by me.", "Checked the entries, all good."]
 CFG = {}
 BUSY = ""
+STOP = False
 LAST_TICK = ""
 _cfg_lock = threading.RLock()
 _work = threading.Lock()
@@ -252,6 +258,29 @@ def gh(cfg, path, body=None, method=None):
             return json.load(r) if r.status != 204 else None
     except urllib.error.HTTPError as e:
         raise GHError(e.code, f"GitHub {e.code} on {path}: {e.read().decode()[:300]}") from None
+
+
+def gql(cfg, query, variables):
+    r = gh(cfg, "/graphql", {"query": query, "variables": variables})
+    if r.get("errors"):
+        raise RuntimeError(r["errors"][0]["message"])
+    return r["data"]
+
+
+def repo_counts(cfg, year):
+    """This account's PRs, issues and reviewed PRs in the activity repo for a year, cached 10 minutes."""
+    hit = _cal.get(("counts", year))
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    login = me(cfg)["login"]
+    base = f"repo:{cfg['repo']} created:{year}-01-01..{year}-12-31 "
+
+    def count(extra):
+        return gql(cfg, "query($q:String!){search(type:ISSUE,query:$q){issueCount}}", {"q": base + extra})["search"]["issueCount"]
+    out = {"prs": count(f"is:pr author:{login}"), "issues": count(f"is:issue author:{login}"),
+           "reviews": count(f"is:pr reviewed-by:{login}")}
+    _cal[("counts", year)] = (time.time(), out)
+    return out
 
 
 def me(cfg):
@@ -584,6 +613,88 @@ def backfill(cfg, start, end, before_creation=False):
         return n
 
 
+def balance_needed(cfg, year):
+    """What the year holds now, what the mix implies for that many commits, and the gap."""
+    cal, totals = calendar(cfg, year)
+    mine = ours(cfg)
+    rc = repo_counts(cfg, year)
+    have = {"commits": totals["commits"] + sum(v for d, v in mine.items() if d.startswith(str(year))),
+            "prs": totals["prs"] + rc["prs"], "issues": totals["issues"] + rc["issues"],
+            "reviews": totals["reviews"] + rc["reviews"]}
+    mix = mix_for(cfg, year)
+    want = {k: round(have["commits"] * mix[k] / max(1, mix["commits"])) for k in ("prs", "issues", "reviews")}
+    want["reviews"] = min(want["reviews"], want["prs"])
+    return {"have": have, "want": want, "need": {k: max(0, want[k] - have[k]) for k in want}}
+
+
+def balance_run(cfg, year):
+    """Create the missing PRs, issues and reviews for a year, paced. GitHub dates them today, there is
+    no other way. PR commits are authored by nobody so the commit count stays where the mix expects it."""
+    global STOP
+    STOP = False
+    with _work:
+        ensure_repo(cfg)
+        need = balance_needed(cfg, year)["need"]
+        log(f"balance {year}: +{need['prs']} PRs, +{need['issues']} issues, +{need['reviews']} reviews, "
+            f"about {sum(need.values()) / max(60, cfg['balance_rate']):.1f} h at {cfg['balance_rate']} an hour")
+        repo, s = cfg["repo"], seed(cfg, year)
+        nobody = dict(os.environ, GIT_AUTHOR_NAME="gapfree", GIT_AUTHOR_EMAIL="gapfree@users.noreply.github.com",
+                      GIT_COMMITTER_NAME="gapfree", GIT_COMMITTER_EMAIL="gapfree@users.noreply.github.com")
+        done, k = {"prs": 0, "issues": 0, "reviews": 0}, 0
+        while not STOP and any(done[x] < need[x] for x in need):
+            try:
+                if done["issues"] < need["issues"]:
+                    title = ISSUE_TITLES[int(fnv(str(k), s, "bt") * len(ISSUE_TITLES))].format(date=f"entry {k + 1}")
+                    n = gh(cfg, f"/repos/{repo}/issues", {"title": title, "body": "Tracking a log entry."})["number"]
+                    gh(cfg, f"/repos/{repo}/issues/{n}", {"state": "closed"}, "PATCH")
+                    done["issues"] += 1
+                if done["prs"] < need["prs"]:
+                    git("fetch", "-q", "origin", "main")
+                    git("reset", "-q", "--hard", "origin/main")
+                    path = os.path.join(REPO, "log", "notes.md")
+                    with open(path, "a") as f:
+                        f.write(f"- note {k + 1}\n")
+                    git("add", "-A")
+                    git("commit", "-q", "-m", "Update notes", env=nobody)
+                    branch = f"notes/{k + 1}-{int(time.time())}"
+                    git("push", "-q", "-f", "origin", f"HEAD:refs/heads/{branch}")
+                    title = PR_TITLES[int(fnv(str(k), s, "bp") * len(PR_TITLES))].format(date=f"note {k + 1}")
+                    pr = open_pr(cfg, title, branch, "Notes.")
+                    if done["reviews"] < need["reviews"]:
+                        gh(cfg, f"/repos/{repo}/pulls/{pr['number']}/reviews",
+                           {"event": "COMMENT", "body": REVIEWS[int(fnv(str(k), s, "br") * len(REVIEWS))]})
+                        done["reviews"] += 1
+                    for attempt in range(5):
+                        try:
+                            gh(cfg, f"/repos/{repo}/pulls/{pr['number']}/merge", {"merge_method": "rebase"}, "PUT")
+                            break
+                        except GHError as e:
+                            if attempt == 4 or e.code in (403, 429):
+                                raise
+                            time.sleep(3)
+                    try:
+                        gh(cfg, f"/repos/{repo}/git/refs/heads/{branch}", method="DELETE")
+                    except GHError:
+                        pass
+                    done["prs"] += 1
+                k += 1
+                if k % 25 == 0:
+                    log(f"balance {year}: {done['prs']}/{need['prs']} PRs, {done['issues']}/{need['issues']} issues, "
+                        f"{done['reviews']}/{need['reviews']} reviews")
+                time.sleep(3600 / max(60, cfg["balance_rate"]))
+            except GHError as e:
+                if e.code in (403, 429):
+                    log(f"GitHub is rate limiting, balance pauses 15 min: {e}")
+                    time.sleep(900)
+                else:
+                    log(f"balance: {e}")
+                    time.sleep(5)
+        git("fetch", "-q", "origin", "main")
+        git("reset", "-q", "--hard", "origin/main")
+        _cal.clear()
+        log(f"balance {year} {'stopped' if STOP else 'done'}: {done['prs']} PRs, {done['issues']} issues, {done['reviews']} reviews")
+
+
 # ---------------------------------------------------------------- setup
 
 def gh_users():
@@ -640,11 +751,12 @@ def state(cfg, year):
     today = now.date().isoformat()
     mine = ours(cfg)
     err = login = avatar = created = ""
-    cal, totals = {}, {}
+    cal, totals, bal = {}, {}, {}
     try:
         u = me(cfg)
         login, avatar, created = u["login"], u["avatar"], u["created"]
         cal, totals = calendar(cfg, year)
+        bal = balance_needed(cfg, year)
     except Exception as e:
         err = str(e)
     days = {}
@@ -679,7 +791,7 @@ def state(cfg, year):
     public = {k: v for k, v in cfg.items() if k not in ("token", "progress")}
     public["token_set"] = bool(cfg["token"])
     return {"year": year, "today": today, "days": days, "login": login, "avatar": avatar, "created": created, "error": err,
-            "version": __version__,
+            "version": __version__, "balance": bal,
             "busy": BUSY, "service": SERVICE, "last_tick": LAST_TICK,
             "repo_ready": repo_ready() and bool(cfg["repo"]), "repo_commits": sum(mine.values()),
             "total": sum(v for k, v in cal.items() if k.startswith(str(year))),
@@ -745,7 +857,7 @@ def norm_repo(cfg, r):
 
 def set_settings(body):
     with _cfg_lock:
-        for k in ("repo", "tz", "hours", "density", "range", "weekends", "mix", "mix_auto", "messages", "topup"):
+        for k in ("repo", "tz", "hours", "density", "range", "weekends", "mix", "mix_auto", "messages", "topup", "balance_rate"):
             if k in body:
                 CFG[k] = body[k]
         if body.get("token"):
@@ -810,6 +922,8 @@ ACTIONS = {
     "/api/backfill": lambda b: (backfill(CFG, b["from"], b["to"], b.get("before_creation")) if b.get("check") else
                                 run_bg(f"backfill {b['from']} to {b['to']}", lambda: backfill(CFG, b["from"], b["to"], b.get("before_creation")))),
     "/api/tick": lambda b: run_bg("tick", lambda: tick(CFG)),
+    "/api/balance": lambda b: run_bg(f"balance {b['year']}", lambda: balance_run(CFG, int(b["year"]))),
+    "/api/stop": lambda b: globals().__setitem__("STOP", True),
 }
 
 
@@ -989,6 +1103,7 @@ details.card summary{cursor:pointer;color:var(--mut);font-size:15px}
   <p class="hint" id="mixnote"></p>
  </div>
  <div><svg class="radar" id="radar" viewBox="0 0 300 236" width="300" height="236"></svg><div class="hint" id="radarnote"></div></div>
+ <div class="row" style="grid-column:1/-1"><span class="hint" id="balline"></span><button class="pri" id="balance" hidden>Balance this year now</button><button id="stopbal" hidden>Stop</button></div>
 </section>
 
 <section class="card">
@@ -1013,7 +1128,7 @@ details.card summary{cursor:pointer;color:var(--mut);font-size:15px}
 <script>
 const $ = id => document.getElementById(id);
 const KEYS = ['commits', 'prs', 'issues', 'reviews'];
-let Y = new Date().getFullYear(), S = null, timer = null, mix = null;
+let Y = new Date().getFullYear(), S = null, timer = null, mixTimer = null, mix = null;
 const api = (p, b) => fetch(p, b ? {method: 'POST', body: JSON.stringify(b)} : {}).then(async r => {
   const j = await r.json(); if (!r.ok) throw new Error(j.error); return j; });
 const level = n => n <= 0 ? 0 : n <= 2 ? 1 : n <= 4 ? 2 : n <= 7 ? 3 : 4;
@@ -1026,7 +1141,7 @@ async function loadLog() { $('log').textContent = (await api('/api/log')).log; $
 
 function render() {
   const s = S.settings;
-  if (!mix || s.mix_auto) mix = {...S.mix_now};
+  if (!mix || s.mix_auto || !mixTimer) mix = {...S.mix_now};
   $('mixauto').checked = s.mix_auto;
   $('avatar').src = S.avatar || '';
   $('ver').textContent = 'v' + S.version;
@@ -1077,10 +1192,10 @@ function renderGrid() {
 }
 
 function renderMix() {
-  KEYS.forEach(k => { $('mix-' + k).value = mix[k]; $('mixv-' + k).textContent = mix[k] + '%'; $('mix-' + k).disabled = !!S.settings.mix_auto; });
+  KEYS.forEach(k => { $('mix-' + k).value = mix[k]; $('mixv-' + k).textContent = mix[k] + '%'; });
   const avg = (S.settings.range[0] + S.settings.range[1]) / 2, per = 1 / Math.max(1, mix.commits);
   const f = k => (avg * mix[k] * per).toFixed(1);
-  $('mixnote').textContent = (S.settings.mix_auto ? `Shape for ${Y} drawn from its seed; Randomize year for another. ` : '') + `An average active day (${avg} commits) brings about ${f('prs')} pull requests, ${f('issues')} issues and ${f('reviews')} reviews.`;
+  $('mixnote').textContent = (S.settings.mix_auto ? `Shape for ${Y} drawn from its seed; move a slider to set it by hand, Randomize year for another draw. ` : '') + `An average active day (${avg} commits) brings about ${f('prs')} pull requests, ${f('issues')} issues and ${f('reviews')} reviews.`;
   const tot = KEYS.reduce((a, k) => a + S.mix[k], 0) || 1;
   const yr = Object.fromEntries(KEYS.map(k => [k, Math.round(100 * S.mix[k] / tot)]));
   const cx = 150, cy = 118, R = 82, ang = {commits: -Math.PI / 2, prs: 0, issues: Math.PI / 2, reviews: Math.PI};
@@ -1096,6 +1211,10 @@ function renderMix() {
   KEYS.forEach(k => svg += `<text x="${lab[k][0]}" y="${lab[k][1]}" text-anchor="${lab[k][2]}">${name[k]} ${yr[k]}%</text>`);
   $('radar').innerHTML = svg;
   $('radarnote').innerHTML = `<span style="color:#39d353">green</span> target · <span style="color:#58a6ff">blue</span> this year: ${S.mix.commits} commits, ${S.mix.prs} PRs, ${S.mix.issues} issues, ${S.mix.reviews} reviews (public activity + repo + plan)`;
+  const b = S.balance || {}, n = b.need || {}, gap = (n.prs || 0) + (n.issues || 0) + (n.reviews || 0);
+  const running = /^balance/.test(S.busy || '');
+  $('balline').textContent = !b.have ? '' : running ? `Balancing ${Y}: see the log.` : gap ? `${Y} holds ${b.have.commits} commits, ${b.have.prs} PRs, ${b.have.issues} issues, ${b.have.reviews} reviews. Matching the sliders means +${n.prs} PRs, +${n.issues} issues, +${n.reviews} reviews, all dated today, about ${(gap / S.settings.balance_rate).toFixed(1)} h at ${S.settings.balance_rate} an hour.` : `${Y} already matches the sliders.`;
+  $('balance').hidden = !gap || running; $('balance').disabled = !!S.busy; $('stopbal').hidden = !running;
 }
 
 function renderAuto() {
@@ -1114,13 +1233,16 @@ function balance(changed, v) {
   const others = KEYS.filter(k => k !== changed), rest = 100 - v, cur = others.reduce((a, k) => a + m[k], 0);
   others.forEach(k => m[k] = cur ? Math.round(m[k] * rest / cur) : Math.round(rest / others.length));
   if (m.reviews > m.prs) { if (changed === 'reviews') m.prs = m.reviews; else m.reviews = m.prs; }
-  if (m.commits < 10) m.commits = 10;
-  const big = others.filter(k => k !== 'reviews' && k !== 'prs').concat(others).find(k => k !== changed && k !== 'reviews');
-  m[big] += 100 - KEYS.reduce((a, k) => a + m[k], 0);
-  if (m[big] < 0) { m.commits += m[big]; m[big] = 0; }
+  const pool = KEYS.filter(k => k !== changed && k !== 'reviews' && !(changed === 'reviews' && k === 'prs'));
+  let diff = 100 - KEYS.reduce((a, k) => a + m[k], 0);
+  for (const k of pool) { const room = diff < 0 ? -(m[k] - (k === 'commits' ? 10 : 0)) : diff; const step = diff < 0 ? Math.max(room, diff) : diff; m[k] += step; diff -= step; if (!diff) break; }
+  if (diff) m[changed] += diff;
   return m;
 }
-KEYS.forEach(k => $('mix-' + k).oninput = e => { mix = balance(k, +e.target.value); renderMix(); clearTimeout(timer); timer = setTimeout(() => api('/api/settings', {mix}).then(load).catch(fail), 200); });
+KEYS.forEach(k => $('mix-' + k).oninput = e => {
+  mix = balance(k, +e.target.value); renderMix();
+  clearTimeout(mixTimer); mixTimer = setTimeout(() => api('/api/settings', {mix, mix_auto: false}).then(() => { mixTimer = null; return load(); }).catch(fail), 200);
+});
 const rnd = (a, b) => a + Math.random() * (b - a);
 $('shuffle').onclick = () => {
   // a shape a real profile could have: commits lead, PRs next, reviews a share of the PRs
@@ -1153,6 +1275,8 @@ $('next').onclick = () => { Y++; load(); };
 $('randomize').onclick = () => api('/api/randomize', {year: Y}).then(load).catch(fail);
 $('forward').onchange = () => api('/api/forward', {on: $('forward').checked}).then(load).catch(fail);
 $('tick').onclick = () => api('/api/tick', {}).then(load).catch(fail);
+$('balance').onclick = () => { if (confirm($('balline').textContent + '\nEvery one of them lands on today, and GitHub may slow the run down. Go?')) api('/api/balance', {year: Y}).then(load).catch(fail); };
+$('stopbal').onclick = () => api('/api/stop', {}).then(load).catch(fail);
 function pin(d) {
   const v = prompt(`Commits gapfree should add on ${d} (0 = keep empty, blank = automatic)`, S.days[d][2] || '');
   if (v === null) return;
@@ -1250,6 +1374,8 @@ if __name__ == "__main__":
         setup(CFG)
     elif cmd[0] == "tick":
         print(tick(CFG), "commits")
+    elif cmd[0] == "balance" and len(cmd) > 1:
+        balance_run(CFG, int(cmd[1]))
     elif cmd[0] == "backfill" and len(cmd) > 2:
         print(backfill(CFG, cmd[1], cmd[2], "--before-creation" in cmd), "commits")
     else:
