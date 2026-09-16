@@ -604,7 +604,7 @@ def backfill(cfg, start, end, before_creation=False):
         ensure_repo(cfg)
         mine = ours(cfg)
         today = dt.datetime.now(zone(cfg)).date().isoformat()
-        cals, n = {}, 0
+        cals, n, pushed = {}, 0, 0
         d = dt.date.fromisoformat(start)
         while d.isoformat() <= end and d.isoformat() < today:
             ds = d.isoformat()
@@ -613,8 +613,11 @@ def backfill(cfg, start, end, before_creation=False):
             taken = cals[d.year].get(ds, 0) - (mine.get(ds, 0) if cfg["topup"] else 0) > 0
             if not (taken and ds not in cfg["overrides"]):  # any activity that day: skip
                 n += sync_past(cfg, ds, mine)
+            if n - pushed >= 800:  # GitHub counts only the newest ~1000 commits of a single push
+                push_main()
+                pushed = n
             d += dt.timedelta(1)
-        if n:
+        if n > pushed:
             push_main()
         _cal.clear()
         log(f"backfill {start} to {end}: {n} commits pushed")
