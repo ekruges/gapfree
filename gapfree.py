@@ -10,6 +10,7 @@ runs. This should not be a paid service.
     python3 gapfree.py serve                        web UI + scheduler on http://localhost:7331
     python3 gapfree.py tick                         one scheduler pass (for cron)
     python3 gapfree.py balance 2026                 create the PRs, issues and reviews the mix implies for a year, now
+    python3 gapfree.py rebuild 2026                 after deleting the repo: new seed, fresh repo, refill, daily run on
     python3 gapfree.py backfill 2024-01-01 2024-12-31 [--before-creation]
 """
 import datetime as dt
@@ -372,12 +373,18 @@ def ensure_repo(cfg):
     if git("ls-remote", "--heads", "origin", "main").strip():
         git("fetch", "-q", "origin", "main")
         git("checkout", "-q", "-B", "main", "origin/main")
-    elif not git("rev-parse", "-q", "--verify", "HEAD", check=False).strip():
-        with open(os.path.join(REPO, "README.md"), "w") as f:
-            f.write(f"# {name}\n\nA running log of daily activity.\n")
-        git("add", "-A")
-        git("commit", "-q", "-m", "Start activity log", env=ident(cfg))
-        git("push", "-q", "-u", "origin", "main")
+        return
+    if git("rev-parse", "-q", "--verify", "HEAD", check=False).strip():  # remote empty, clone not: the repo was recreated
+        subprocess.run(["rm", "-rf", REPO])
+        os.makedirs(REPO, 0o700)
+        git("init", "-q")
+        git("symbolic-ref", "HEAD", "refs/heads/main")
+        git("remote", "add", "origin", url)
+    with open(os.path.join(REPO, "README.md"), "w") as f:
+        f.write(f"# {name}\n\nA running log of daily activity.\n")
+    git("add", "-A")
+    git("commit", "-q", "-m", "Start activity log", env=ident(cfg))
+    git("push", "-q", "-u", "origin", "main")
 
 
 def ours(cfg):
@@ -695,6 +702,29 @@ def balance_run(cfg, year):
         log(f"balance {year} {'stopped' if STOP else 'done'}: {done['prs']} PRs, {done['issues']} issues, {done['reviews']} reviews")
 
 
+def rebuild(cfg, year):
+    """After the activity repo was deleted: a new seed for the year, a fresh repo, everything refilled from
+    the account's first day to yesterday, then the daily run back on."""
+    with _cfg_lock:
+        cfg["seeds"][str(year)] = int.from_bytes(os.urandom(4), "big")
+        cfg["progress"] = {}
+        cfg["forward"], cfg["forward_since"] = False, ""
+        save(cfg)
+    subprocess.run(["rm", "-rf", REPO])
+    today = dt.datetime.now(zone(cfg)).date()
+    for _ in range(30):  # GitHub drops the deleted repo's contributions within minutes; wait for that
+        _cal.clear()
+        if sum(calendar(cfg, year)[0].values()) < 1500:
+            break
+        log("rebuild: waiting for GitHub to forget the deleted repo")
+        time.sleep(30)
+    n = backfill(cfg, me(cfg)["created"], (today - dt.timedelta(1)).isoformat())
+    with _cfg_lock:
+        cfg["forward"], cfg["forward_since"] = True, today.isoformat()
+        save(cfg)
+    log(f"rebuild done: {n} commits, daily run on")
+
+
 # ---------------------------------------------------------------- setup
 
 def gh_users():
@@ -924,6 +954,7 @@ ACTIONS = {
     "/api/tick": lambda b: run_bg("tick", lambda: tick(CFG)),
     "/api/balance": lambda b: run_bg(f"balance {b['year']}", lambda: balance_run(CFG, int(b["year"]))),
     "/api/stop": lambda b: globals().__setitem__("STOP", True),
+    "/api/rebuild": lambda b: run_bg(f"rebuild {b['year']}", lambda: rebuild(CFG, int(b["year"]))),
 }
 
 
@@ -1376,6 +1407,8 @@ if __name__ == "__main__":
         print(tick(CFG), "commits")
     elif cmd[0] == "balance" and len(cmd) > 1:
         balance_run(CFG, int(cmd[1]))
+    elif cmd[0] == "rebuild" and len(cmd) > 1:
+        rebuild(CFG, int(cmd[1]))
     elif cmd[0] == "backfill" and len(cmd) > 2:
         print(backfill(CFG, cmd[1], cmd[2], "--before-creation" in cmd), "commits")
     else:
