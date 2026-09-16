@@ -36,7 +36,7 @@ for d in days:
     ts = p["commits"]
     assert len(ts) == plan[d] and ts == sorted(ts) and 9 * 60 <= ts[0] and ts[-1] <= 16 * 60 - 1, (d, ts)
     gaps = {b - a for a, b in zip(ts, ts[1:])}
-    assert len(gaps) <= 1 and all(3 <= x <= 12 for x in gaps), (d, ts)
+    assert len(gaps) <= 1 and all(1 <= x <= 12 for x in gaps), (d, ts)
     prev = 0
     for grp in p["prs"]:
         assert prev <= grp["start"] < grp["end"] <= len(ts) and 1 <= grp["end"] - grp["start"] <= 3, (d, p["prs"])
@@ -62,3 +62,7 @@ for y in (2025, 2026, 2027):
 assert g.mix_for(auto, 2025) != g.mix_for(auto, 2026) or g.mix_for(auto, 2026) != g.mix_for(auto, 2027)
 assert g.mix_for(cfg, 2025) == cfg["mix"]
 print("auto mix ok", [g.mix_for(auto, y) for y in (2025, 2026, 2027)])
+
+big = g.minutes(cfg, "2025-03-03", 40)
+assert big == sorted(big) and len(set(big)) == 40 and big[-1] <= 16 * 60 - 1, big
+print("busy day ok")

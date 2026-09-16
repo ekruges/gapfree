@@ -163,6 +163,7 @@ def minutes(cfg, date, n):
     s = seed(cfg, date[:4])
     a, b = cfg["hours"][0] * 60, cfg["hours"][1] * 60 - 1
     gap = 3 + int(fnv(date, s, "gp") * 10)
+    gap = max(1, min(gap, (b - a) // max(1, n - 1)))  # a busy day shrinks the gap rather than piling up at the end
     start = a + int(fnv(date, s, "st") * (b - a))
     start = max(a, min(start, b - (n - 1) * gap))
     return [min(start + i * gap, b) for i in range(n)]
